@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+dhanhq
+websockets
+pandas
+pydantic
+jinja2
+python-multipart
+numpy
+requests
+aiohttp
+ujson
+psutil

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dhan Ultra-Ladder Algo</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <h1>⚡ UltraLadder <span style="font-weight:300; opacity:0.7">Algo</span></h1>
+            <div class="header-stats">
+                <div class="status-indicator">
+                    <div class="dot" id="statusDot"></div>
+                    <span id="connectionStatus">Disconnected</span>
+                </div>
+                <div class="perf-indicator" id="perfStats">
+                    <small>Latency: <span id="latency">-</span>ms</small>
+                </div>
+            </div>
+        </header>
+
+        <div class="dashboard-grid">
+            <!-- Sidebar / Settings -->
+            <div class="card settings-panel">
+                <h2>Configuration</h2>
+
+                <div class="form-group">
+                    <label>Client ID</label>
+                    <input type="text" id="clientId" placeholder="Dhan Client ID">
+                </div>
+                <div class="form-group">
+                    <label>Access Token</label>
+                    <input type="password" id="accessToken" placeholder="Access Token">
+                </div>
+                <button id="connectBtn" class="btn btn-primary" style="margin-bottom: 20px;">Connect API</button>
+
+                <div style="border-top: 1px solid rgba(255,255,255,0.1); margin: 10px 0;"></div>
+
+                <h3>Strategy Settings</h3>
+                <div class="form-group">
+                    <label>Trade Capital</label>
+                    <input type="number" id="capital" value="100000">
+                </div>
+                <div class="form-group">
+                    <label>Top N Gainers</label>
+                    <input type="number" id="topGainers" value="5">
+                </div>
+                <div class="form-group">
+                    <label>Top N Losers</label>
+                    <input type="number" id="topLosers" value="5">
+                </div>
+                <div class="form-group">
+                    <label>Add Ons (Count)</label>
+                    <input type="number" id="noAddOns" value="5">
+                </div>
+                <div class="form-group">
+                    <label>Add On % Rise</label>
+                    <input type="number" id="addOnPct" value="0.5" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>Initial Stop Loss %</label>
+                    <input type="number" id="initSLPct" value="0.5" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>Trailing SL %</label>
+                    <input type="number" id="tslPct" value="0.5" step="0.1">
+                </div>
+                <div class="form-group">
+                    <label>Target %</label>
+                    <input type="number" id="targetPct" value="2.0" step="0.1">
+                </div>
+
+                <h3>Risk Limits</h3>
+                <div class="form-group">
+                    <label>Stock Profit Target</label>
+                    <input type="number" id="stockProfitTarget" value="5000">
+                </div>
+                <div class="form-group">
+                    <label>Stock Loss Limit</label>
+                    <input type="number" id="stockLossLimit" value="2000">
+                </div>
+                <div class="form-group">
+                    <label>Min Turnover (Cr)</label>
+                    <input type="number" id="minTurnover" value="1.0" step="0.1">
+                </div>
+
+                <button id="saveSettingsBtn" class="btn btn-success" style="margin-top: 15px; width: 100%;">
+                    💾 Save Settings
+                </button>
+
+                <div style="border-top: 1px solid rgba(255,255,255,0.1); margin: 15px 0;"></div>
+
+                <div style="display: flex; gap: 10px;">
+                    <button id="startBtn" class="btn btn-primary">Start Algo</button>
+                    <button id="stopBtn" class="btn btn-danger">STOP</button>
+                </div>
+
+                <button id="squareOffAllBtn" class="btn btn-emergency" style="margin-top: 15px; width: 100%;">
+                    ⚠️ SQUARE OFF ALL
+                </button>
+            </div>
+
+            <!-- Main Monitor -->
+            <div class="main-monitor">
+                <div class="monitor-stats">
+                    <div class="card stat-box">
+                        <small>Total Global P&L</small>
+                        <div id="globalPnl" class="stat-value">₹0.00</div>
+                    </div>
+                    <div class="card stat-box">
+                        <small>Active Ladders</small>
+                        <div id="activeLadders" class="stat-value">0</div>
+                    </div>
+                    <div class="card stat-box">
+                        <small>Total Stocks</small>
+                        <div id="totalStocks" class="stat-value">0</div>
+                    </div>
+                    <div class="card stat-box">
+                        <small>Tick Rate</small>
+                        <div id="tickRate" class="stat-value">0/s</div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Active Positions</h2>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Symbol</th>
+                                    <th>Mode</th>
+                                    <th>LTP</th>
+                                    <th>% Change</th>
+                                    <th>P&L</th>
+                                    <th>Qty</th>
+                                    <th>Level</th>
+                                    <th>Avg Entry</th>
+                                    <th>TSL</th>
+                                    <th>Target</th>
+                                    <th>Turnover</th>
+                                    <th>Status</th>
+                                    <th>Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="activeLaddersBody">
+                                <!-- Populated via JS -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-top: 20px;">
+                    <h2>Performance Metrics</h2>
+                    <div class="metrics-grid">
+                        <div class="metric-item">
+                            <small>Tick Latency (avg)</small>
+                            <span id="tickLatency">-</span>
+                        </div>
+                        <div class="metric-item">
+                            <small>Order Latency (avg)</small>
+                            <span id="orderLatency">-</span>
+                        </div>
+                        <div class="metric-item">
+                            <small>CPU Usage</small>
+                            <span id="cpuUsage">-</span>
+                        </div>
+                        <div class="metric-item">
+                            <small>Memory (MB)</small>
+                            <span id="memoryUsage">-</span>
+                        </div>
+                        <div class="metric-item">
+                            <small>Total Orders</small>
+                            <span id="totalOrders">0</span>
+                        </div>
+                        <div class="metric-item">
+                            <small>Success Rate</small>
+                            <span id="successRate">-</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-top: 20px;">
+                    <h2>Logs</h2>
+                    <div id="logsContainer"
+                        style="height: 150px; overflow-y: auto; font-family: monospace; font-size: 0.8rem; color: #94a3b8;">
+                        <p>> System Initialized...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+
+</html>
