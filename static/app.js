@@ -19,6 +19,13 @@ const getVal = (id) => document.getElementById(id).value;
 const setVal = (id, val) => document.getElementById(id).value = val;
 
 // API Interaction
+function backendHint() {
+    if (window.location.protocol === 'file:' || !window.location.host) {
+        return "Backend not running. Open http://localhost:8000 (don't open index.html directly).";
+    }
+    return 'Backend not reachable. Start server: python -m uvicorn main:app --reload --port 8000';
+}
+
 async function connectDhan() {
     const payload = {
         client_id: getVal('clientId'),
@@ -45,6 +52,9 @@ async function connectDhan() {
     } catch (e) {
         console.error(e);
         addLog('❌ API Error: ' + e.message);
+        if ((e.message || '').toLowerCase().includes('failed to fetch')) {
+            addLog('⚠️ ' + backendHint());
+        }
     }
 }
 
@@ -59,6 +69,9 @@ async function startStrategy() {
         }
     } catch (e) {
         addLog('❌ Start failed: ' + e.message);
+        if ((e.message || '').toLowerCase().includes('failed to fetch')) {
+            addLog('⚠️ ' + backendHint());
+        }
     }
 }
 
@@ -104,6 +117,9 @@ async function saveSettings() {
     } catch (e) {
         console.error('Save error:', e);
         addLog('❌ Save failed: ' + e.message);
+        if ((e.message || '').toLowerCase().includes('failed to fetch')) {
+            addLog('⚠️ ' + backendHint());
+        }
     }
 }
 
@@ -159,11 +175,23 @@ function updateSettingsFromUI(obj) {
     obj.trailing_stop_loss_pct = parseFloat(getVal('tslPct'));
     obj.target_percentage = parseFloat(getVal('targetPct'));
     obj.trade_capital = parseFloat(getVal('capital'));
+    obj.max_ladder_stocks = Math.max(1, parseInt(getVal('maxLadderStocks') || 20));
     obj.profit_target_per_stock = parseFloat(getVal('stockProfitTarget'));
     obj.loss_limit_per_stock = parseFloat(getVal('stockLossLimit'));
     obj.top_n_gainers = parseInt(getVal('topGainers') || 5);
     obj.top_n_losers = parseInt(getVal('topLosers') || 5);
     obj.min_turnover_crores = parseFloat(getVal('minTurnover') || 1.0);
+
+    // Enforce: top_n_gainers + top_n_losers <= max_ladder_stocks
+    const maxLadders = Number.isFinite(obj.max_ladder_stocks) ? obj.max_ladder_stocks : 1;
+        const g = Math.max(0, obj.top_n_gainers || 0);
+        const l = Math.max(0, obj.top_n_losers || 0);
+        if (g + l > maxLadders) {
+            const adjustedLosers = Math.max(0, maxLadders - g);
+            obj.top_n_losers = adjustedLosers;
+            setVal('topLosers', adjustedLosers);
+            addLog(`⚠️ Adjusted Top N Losers to ${adjustedLosers} (Max Ladder Stocks=${maxLadders})`);
+        }
     return obj;
 }
 
@@ -186,6 +214,7 @@ function loadSettingsFromLocalStorage() {
             if (settings.trailing_stop_loss_pct !== undefined) setVal('tslPct', settings.trailing_stop_loss_pct);
             if (settings.target_percentage !== undefined) setVal('targetPct', settings.target_percentage);
             if (settings.trade_capital !== undefined) setVal('capital', settings.trade_capital);
+            if (settings.max_ladder_stocks !== undefined) setVal('maxLadderStocks', settings.max_ladder_stocks);
             if (settings.profit_target_per_stock !== undefined) setVal('stockProfitTarget', settings.profit_target_per_stock);
             if (settings.loss_limit_per_stock !== undefined) setVal('stockLossLimit', settings.loss_limit_per_stock);
             if (settings.top_n_gainers !== undefined) setVal('topGainers', settings.top_n_gainers);
@@ -219,6 +248,11 @@ function addLog(message) {
     const logEntry = document.createElement('p');
     logEntry.textContent = `[${timestamp}] ${message}`;
     logsContainer.appendChild(logEntry);
+
+    // Keep DOM light for smooth scrolling
+    while (logsContainer.childElementCount > 200) {
+        logsContainer.removeChild(logsContainer.firstChild);
+    }
     logsContainer.scrollTop = logsContainer.scrollHeight;
 }
 
@@ -243,8 +277,46 @@ function formatTurnover(value) {
 // WebSocket with reconnection
 let ws;
 let wsReconnectTimer;
+let lastTopMoversFetch = 0;
+let marketOpenState = null;
+
+async function fetchTopMovers() {
+    const now = Date.now();
+    if (now - lastTopMoversFetch < 30000) {
+        return;
+    }
+    lastTopMoversFetch = now;
+
+    try {
+        const res = await fetch('/api/top-movers');
+        const data = await res.json();
+        if (data.status !== 'success') {
+            return;
+        }
+
+        const gainers = (data.gainers || [])
+            .map(s => `${s.symbol} ${formatPercent(s.change_pct)}`)
+            .slice(0, 5)
+            .join(', ');
+        const losers = (data.losers || [])
+            .map(s => `${s.symbol} ${formatPercent(s.change_pct)}`)
+            .slice(0, 5)
+            .join(', ');
+
+        const gainersEl = document.getElementById('topGainersApi');
+        const losersEl = document.getElementById('topLosersApi');
+        if (gainersEl) gainersEl.textContent = gainers || '-';
+        if (losersEl) losersEl.textContent = losers || '-';
+    } catch (e) {
+        console.error('Top movers fetch failed:', e);
+    }
+}
 
 function connectWebSocket() {
+    if (window.location.protocol === 'file:' || !window.location.host) {
+        addLog('⚠️ ' + backendHint());
+        return;
+    }
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
@@ -266,10 +338,11 @@ function connectWebSocket() {
 
         updateStatus(data.dhan_connected);
 
-        // Update stock counts
-        const activeCount = data.active_stocks.filter(s => s.mode !== 'NONE').length;
+        const positions = data.positions || data.active_stocks || [];
+        const activeCount = Number.isFinite(data.active_positions) ? data.active_positions : positions.length;
+        const totalStocks = Number.isFinite(data.total_stocks) ? data.total_stocks : positions.length;
         document.getElementById('activeLadders').textContent = activeCount;
-        document.getElementById('totalStocks').textContent = data.active_stocks.length;
+        document.getElementById('totalStocks').textContent = totalStocks;
 
         // Update performance metrics
         if (data.performance && data.performance.tick_stats) {
@@ -285,15 +358,20 @@ function connectWebSocket() {
             document.getElementById('latency').textContent = tickStats.avg_latency_ms.toFixed(1);
         }
 
+        // When market is closed, fetch top movers via REST
+        marketOpenState = data.market_open;
+        if (data.market_open === false) {
+            fetchTopMovers();
+        }
+
         // Render Table with document fragment for performance
         const fragment = document.createDocumentFragment();
 
-        data.active_stocks.forEach(stock => {
-            // SHOW ALL STOCKS - including IDLE ones so user can see live data
-            // Comment this out to see all stocks:
-            // if (stock.mode === 'NONE' && stock.status === 'IDLE') {
-            //     return; // Skip idle stocks
-            // }
+        positions.forEach(stock => {
+            // Default: skip idle rows for smooth UI (backend usually doesn't send them)
+            if (stock.mode === 'NONE' && stock.status === 'IDLE') {
+                return;
+            }
 
             const row = document.createElement('tr');
 
@@ -371,15 +449,46 @@ squareOffAllBtn.onclick = squareOffAll;
 // Initialize: Load settings and connect WebSocket
 console.log('[DEBUG] Initializing app...');
 loadSettingsFromLocalStorage();
+
+// Apply saved settings to backend on refresh (so Start uses same config)
+try {
+    const saved = localStorage.getItem('ladder_settings');
+    if (saved) {
+        let body = saved;
+        // Don't send credentials on refresh; backend preserves them if already connected.
+        try {
+            const parsed = JSON.parse(saved);
+            delete parsed.client_id;
+            delete parsed.access_token;
+            body = JSON.stringify(parsed);
+        } catch (e) { }
+
+        fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body
+        }).catch(() => { });
+    }
+} catch (e) { }
+
 connectWebSocket();
 
 // Periodic health check
 setInterval(async () => {
     try {
-        const res = await fetch('/api/health');
+        const res = await fetch('/api/status');
         const data = await res.json();
-        // Could update UI based on health status
+        if (typeof data.market_open === 'boolean') {
+            marketOpenState = data.market_open;
+        }
     } catch (e) {
         console.error('Health check failed:', e);
     }
 }, 30000); // Every 30 seconds
+
+// Periodic top movers refresh (closed market or no ticks)
+setInterval(() => {
+    if (marketOpenState === false) {
+        fetchTopMovers();
+    }
+}, 60000);

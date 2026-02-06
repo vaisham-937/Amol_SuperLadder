@@ -14,13 +14,26 @@ import logging
 from datetime import datetime
 from typing import Dict, Tuple, Optional
 from dhan_client import DhanClientWrapper
+from credentials_store import load_credentials
+from redis_store import save_candidates
 from strategy_engine import STOCK_LIST
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Setup logging (IST timestamps)
+from zoneinfo import ZoneInfo
+IST = ZoneInfo("Asia/Kolkata")
+
+class ISTFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, IST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.isoformat(sep=" ", timespec="milliseconds")
+
+handler = logging.StreamHandler()
+handler.setFormatter(ISTFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.handlers = [handler]
 logger = logging.getLogger(__name__)
 
 # Filtration criteria
@@ -141,6 +154,12 @@ class PremarketFilter:
             json.dump(data, f, indent=2)
         
         logger.info(f"Saved {len(candidates)} candidates to {filepath}")
+        
+        # Also store in Redis for all-day reuse
+        if save_candidates(candidates, data):
+            logger.info("Saved candidates to Redis (valid for the day)")
+        else:
+            logger.warning("Could not save candidates to Redis")
 
 
 async def main():
@@ -153,14 +172,22 @@ async def main():
     import os
     from getpass import getpass
     
-    # Try to load from environment variables first
+    # Try environment variables first
     client_id = os.getenv('DHAN_CLIENT_ID')
     access_token = os.getenv('DHAN_ACCESS_TOKEN')
+
+    # If not in env, try saved credentials file
+    if not client_id or not access_token:
+        saved_client_id, saved_access_token = load_credentials()
+        client_id = client_id or saved_client_id
+        access_token = access_token or saved_access_token
     
-    # If not in environment, prompt user
+    # If still missing, prompt user
     if not client_id or not access_token:
         logger.info("\nDhan API Credentials Required")
         logger.info("You can set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN environment variables")
+        logger.info("or save credentials once from the web app and re-run:")
+        logger.info("  - Click 'Save Settings' after entering credentials")
         logger.info("or enter them now:\n")
         
         if not client_id:

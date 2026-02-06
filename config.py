@@ -14,12 +14,13 @@ class StrategySettings(BaseModel):
     target_percentage: float = 2.0
     
     # Selection Settings
-    top_n_gainers: int = 5
-    top_n_losers: int = 5
+    max_ladder_stocks: int = 20
+    top_n_gainers: int = 10
+    top_n_losers: int = 10
     min_turnover_crores: float = 1.0
     
     # Risk Management
-    trade_capital: float = 5000.0
+    trade_capital: float = 1000.0
     profit_target_per_stock: float = 5000.0
     loss_limit_per_stock: float = 2000.0
     
@@ -54,7 +55,7 @@ class StockStatus(BaseModel):
 class PerformanceSettings(BaseModel):
     """Performance and optimization settings."""
     tick_batch_interval_ms: int = 100
-    max_concurrent_orders: int = 5
+    max_concurrent_orders: int = 2
     enable_performance_logging: bool = True
     websocket_reconnect_delay_seconds: int = 5
     order_retry_max_attempts: int = 3

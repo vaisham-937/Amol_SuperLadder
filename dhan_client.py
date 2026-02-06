@@ -1,5 +1,6 @@
 import logging
 import pandas as pd
+import base64
 from datetime import datetime, timedelta
 from dhanhq import dhanhq
 from dhanhq import marketfeed
@@ -13,6 +14,7 @@ from collections import deque
 import ujson
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 try:
     import ujson as json
@@ -119,6 +121,8 @@ class DhanClientWrapper:
         self.id_map = {}
         self.feed = None
         self.ws_thread = None
+        self._ws_stop = threading.Event()
+        self._ws_lock = threading.Lock()
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 10
         self.reconnect_delay = 5
@@ -134,10 +138,49 @@ class DhanClientWrapper:
         self.tick_batch_lock = threading.Lock()
         self.last_batch_process = time.time()
         self.batch_interval = 0.1  # 100ms batching
+        
+        # Tick diagnostics
+        self._tick_count = 0
+        self._last_tick_log = 0.0
+        self._last_unknown_tick_log = 0.0
 
-    def connect(self, client_id, access_token):
+    @staticmethod
+    def _extract_client_id_from_token(access_token: str):
+        """Best-effort extract Dhan client id from JWT access token payload."""
+        if not access_token or access_token.count(".") < 2:
+            return None
+        try:
+            payload_b64 = access_token.split(".", 2)[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            payload_raw = base64.urlsafe_b64decode(payload_b64.encode("utf-8"))
+            payload = json.loads(payload_raw.decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+
+        cid = (
+            payload.get("dhanClientId")
+            or payload.get("dhanClientID")
+            or payload.get("clientId")
+            or payload.get("client_id")
+        )
+        if cid is None:
+            return None
+        return str(cid).strip() or None
+
+    def connect(self, client_id, access_token, prefetch_security_master: bool = True):
         """Connects to Dhan API."""
         try:
+            token_client_id = self._extract_client_id_from_token(access_token)
+            if token_client_id and token_client_id.isdigit():
+                provided = str(client_id).strip() if client_id is not None else ""
+                if not provided.isdigit() or provided != token_client_id:
+                    if provided:
+                        logger.warning(
+                            f"Client ID mismatch: provided={provided} token={token_client_id}. "
+                            "Using token client id."
+                        )
+                    client_id = token_client_id
+
             self.dhan = dhanhq(client_id, access_token)
             self.client_id = client_id
             self.access_token = access_token
@@ -147,11 +190,13 @@ class DhanClientWrapper:
             self.is_connected = True
             logger.info("Connected to Dhan API Successfully")
             
-            # Fetch Security Master
-            self.fetch_security_mapping()
-            
-            # Build reverse mapping for fast lookups
-            self._build_reverse_mapping()
+            # Fetch Security Master (can be slow; skip during app startup)
+            if prefetch_security_master and not self.symbol_map:
+                self.fetch_security_mapping()
+
+            # Build reverse mapping for fast lookups (only if we have data)
+            if self.symbol_map and not self.id_map:
+                self._build_reverse_mapping()
             
             return True, "Connected"
         except Exception as e:
@@ -194,6 +239,14 @@ class DhanClientWrapper:
         except Exception as e:
             logger.error(f"Failed to fetch Security Master: {e}")
 
+    def ensure_security_mapping_loaded(self) -> bool:
+        """Ensure symbol/security-id mappings are available (fetch lazily if missing)."""
+        if not self.symbol_map:
+            self.fetch_security_mapping()
+        if self.symbol_map and not self.id_map:
+            self._build_reverse_mapping()
+        return bool(self.symbol_map)
+
     def _build_reverse_mapping(self):
         """Build reverse mapping for O(1) lookups."""
         # Keep IDs as integers in reverse mapping
@@ -227,6 +280,11 @@ class DhanClientWrapper:
         logger.info(f"WebSocket will use: client_id={self.client_id[:10]}..., access_token={'*' * len(self.access_token) if self.access_token else 'NONE'}")
 
         try:
+            # Ensure we have security-id mapping (may have been skipped during startup connect)
+            if not self.ensure_security_mapping_loaded():
+                logger.error("Cannot subscribe: security master mapping not loaded")
+                return
+
             logger.info(f"Subscribing to {len(symbols)} symbols...")
             
             # Map symbols to IDs (as integers, then convert to string for websocket subscription)
@@ -234,7 +292,7 @@ class DhanClientWrapper:
             for s in symbols:
                 sid = self.get_security_id(s)  # Returns int
                 if sid:
-                    sub_list.append(str(sid))  # Convert to string for WebSocket
+                    sub_list.append(int(sid))
                 else:
                     logger.warning(f"Could not map {s} for subscription")
 
@@ -243,35 +301,61 @@ class DhanClientWrapper:
                 return
 
             # Prepare instruments list
-            # NSE = 1, BSE = 2 (Dhan API constants)
-            exch_code = 1  # NSE
-            instruments = [(exch_code, sid) for sid in sub_list]
+            # Use Dhan SDK constants; subscribe to Quote to get volume (needed for turnover filters)
+            exch_code = marketfeed.NSE  # NSE
+            instruments = [(exch_code, str(sid), marketfeed.Quote) for sid in sub_list]
             
             logger.info(f"Starting DhanFeed for {len(instruments)} instruments")
             
             # Initialize Feed
+            # Use v2 WebSocket as per Dhan docs
             self.feed = marketfeed.DhanFeed(
-                self.client_id, 
-                self.access_token, 
-                instruments
+                self.client_id,
+                self.access_token,
+                instruments,
+                version="v2",
             )
+
+            # Patch SDK server-disconnect handler to log reason (SDK prints to stdout by default)
+            try:
+                import struct
+                import types
+
+                def _server_disconnection(self_feed, data):
+                    try:
+                        packet = struct.unpack("<BHBIH", data[0:10])
+                        code = int(packet[4])
+                    except Exception:
+                        code = None
+
+                    reasons = {
+                        805: "Active websocket connections exceeded",
+                        806: "Subscribe to Data APIs to continue",
+                        807: "Access token is expired",
+                        808: "Invalid client ID",
+                        809: "Authentication failed",
+                    }
+                    reason = reasons.get(code, "Server disconnected")
+
+                    setattr(self_feed, "on_close", True)
+                    setattr(self_feed, "last_disconnect_code", code)
+                    setattr(self_feed, "last_disconnect_reason", reason)
+                    logger.error(f"Dhan server disconnect: code={code} reason={reason}")
+                    return None
+
+                self.feed.server_disconnection = types.MethodType(_server_disconnection, self.feed)
+            except Exception as e:
+                logger.debug(f"Could not patch server disconnection handler: {e}")
             
             # Store callback for reconnection
             self._callback = callback
+            self._symbols = list(symbols)
             
-            # Set callbacks
-            self.feed.on_connect = self._on_ws_connect
-            self.feed.on_message = lambda tick: self._on_tick(tick, callback)
-            self.feed.on_error = self._on_ws_error
-            self.feed.on_close = self._on_ws_close
-            
-            # CRITICAL FIX: Use asyncio.run() to properly handle event loop
-            # This creates a fresh event loop in the thread and runs it to completion
+            # Run WebSocket loop in a dedicated thread
             def run_feed_in_thread():
-                """Run DhanFeed in separate thread using asyncio.run()."""
+                """Run DhanFeed in separate thread and consume ticks."""
                 import asyncio
-                
-                # Try to import nest_asyncio if available (helps with nested loops)
+
                 try:
                     import nest_asyncio
                     nest_asyncio.apply()
@@ -280,24 +364,96 @@ class DhanClientWrapper:
                     logger.warning("nest_asyncio not available, continuing without it")
                 except Exception as e:
                     logger.warning(f"Could not apply nest_asyncio: {e}")
-                
-                # Create new loop for this thread
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                
-                try:
-                    # Connect and run the WebSocket
-                    loop.run_until_complete(self.feed.connect())
-                    logger.info("Dhan WebSocket Connected Successfully")
-                    # Keep the connection alive
-                    loop.run_forever()
-                except Exception as e:
-                    logger.error(f"WebSocket error in thread: {e}", exc_info=True)
-                finally:
-                    loop.close()
-            
-            self.ws_thread = threading.Thread(target=run_feed_in_thread, daemon=True)
-            self.ws_thread.start()
+
+                async def _run():
+                    self.reconnect_attempts = 0
+                    while not self._ws_stop.is_set():
+                        try:
+                            await self.feed.connect()
+                            logger.info("Dhan WebSocket Connected Successfully")
+                            self._on_ws_connect(self.feed)
+
+                            # Reset attempts after a successful connect
+                            self.reconnect_attempts = 0
+
+                            while not self._ws_stop.is_set():
+                                tick = await self.feed.get_instrument_data()
+                                if getattr(self.feed, "on_close", False):
+                                    code = getattr(self.feed, "last_disconnect_code", None)
+                                    reason = getattr(self.feed, "last_disconnect_reason", "unknown")
+                                    fatal_codes = {806, 807, 808, 809}
+                                    if code in fatal_codes:
+                                        logger.error(
+                                            f"Fatal Dhan disconnect (code={code}): {reason}. "
+                                            "Stopping feed; refresh credentials / subscription."
+                                        )
+                                        self._ws_stop.set()
+                                    raise ConnectionError(f"Dhan server disconnect (code={code}): {reason}")
+
+                                if tick:
+                                    self._on_tick(tick, callback)
+                        except ConnectionError as e:
+                            logger.error(str(e))
+                            self._on_ws_error(self.feed, e)
+                            self.reconnect_attempts += 1
+
+                            code = getattr(self.feed, "last_disconnect_code", None)
+                            if code == 805:
+                                # Too many active connections; back off hard
+                                backoff = min(10 * (2 ** min(self.reconnect_attempts, 6)), 300)
+                            else:
+                                backoff = min(2 * (2 ** min(self.reconnect_attempts, 6)), 60)
+
+                            if self._ws_stop.is_set():
+                                break
+                            await asyncio.sleep(backoff)
+                        except ConnectionClosedError as e:
+                            logger.warning(f"WebSocket closed unexpectedly: {e}")
+                            self._on_ws_error(self.feed, e)
+                            self.reconnect_attempts += 1
+                            backoff = min(2 * (2 ** min(self.reconnect_attempts, 6)), 60)
+                            if self._ws_stop.is_set():
+                                break
+                            await asyncio.sleep(backoff)
+                        except InvalidStatus as e:
+                            # 429 = too many requests / connections; back off hard
+                            logger.error(f"WebSocket handshake rejected: {e}", exc_info=True)
+                            self._on_ws_error(self.feed, e)
+                            self.reconnect_attempts += 1
+                            backoff = min(10 * (2 ** min(self.reconnect_attempts, 6)), 300)
+                            if self._ws_stop.is_set():
+                                break
+                            await asyncio.sleep(backoff)
+                        except Exception as e:
+                            logger.error(f"WebSocket error in thread: {e}", exc_info=True)
+                            self._on_ws_error(self.feed, e)
+                            self.reconnect_attempts += 1
+                            backoff = min(2 * (2 ** min(self.reconnect_attempts, 6)), 60)
+                            if self._ws_stop.is_set():
+                                break
+                            await asyncio.sleep(backoff)
+                        finally:
+                            try:
+                                if getattr(self.feed, "ws", None):
+                                    await self.feed.ws.close()
+                            except Exception:
+                                pass
+                            try:
+                                setattr(self.feed, "ws", None)
+                            except Exception:
+                                pass
+                            self._on_ws_close(self.feed)
+
+                asyncio.run(_run())
+
+            with self._ws_lock:
+                # Ensure we don't start multiple websocket threads
+                if self.ws_thread and self.ws_thread.is_alive():
+                    logger.info("WebSocket thread already running; skipping new start")
+                    return
+                self._ws_stop.clear()
+                self.ws_thread = threading.Thread(target=run_feed_in_thread, daemon=True)
+                self.ws_thread.start()
             
             logger.info("WebSocket Thread Started")
             
@@ -313,7 +469,11 @@ class DhanClientWrapper:
 
     def _on_ws_close(self, instance):
         logger.warning("Dhan WebSocket Closed")
-        self._handle_reconnect()
+        # Reconnect is handled inside the websocket thread loop.
+
+    def stop_feed(self):
+        """Stop websocket feed and prevent reconnection attempts."""
+        self._ws_stop.set()
 
     def _handle_reconnect(self):
         """Handle WebSocket reconnection with exponential backoff."""
@@ -329,8 +489,8 @@ class DhanClientWrapper:
         time.sleep(delay)
         
         try:
-            if hasattr(self, '_callback') and hasattr(self, '_instruments'):
-                self.subscribe(self._instruments, self._callback)
+            if hasattr(self, '_callback') and hasattr(self, '_symbols'):
+                self.subscribe(self._symbols, self._callback)
         except Exception as e:
             logger.error(f"Reconnection failed: {e}")
 
@@ -339,33 +499,75 @@ class DhanClientWrapper:
         start_time = time.time()
         
         try:
-            # Check for LTP
-            if 'LTP' in tick_data and 'security_id' in tick_data:
-                sid = int(tick_data['security_id'])
-                ltp = float(tick_data['LTP'])
+            # Handle list/batched tick payloads
+            if isinstance(tick_data, list):
+                for item in tick_data:
+                    self._on_tick(item, callback)
+                return
+            
+            if isinstance(tick_data, dict) and isinstance(tick_data.get('data'), list):
+                for item in tick_data['data']:
+                    self._on_tick(item, callback)
+                return
+
+            if not isinstance(tick_data, dict):
+                return
+
+            # Extract security id (support multiple key names)
+            sid_val = (
+                tick_data.get('security_id')
+                or tick_data.get('securityId')
+                or tick_data.get('sec_id')
+            )
+
+            # Extract LTP (support multiple key names)
+            ltp_val = (
+                tick_data.get('LTP')
+                or tick_data.get('ltp')
+                or tick_data.get('last_traded_price')
+                or tick_data.get('last_price')
+            )
+
+            if sid_val is None or ltp_val is None:
+                now = time.time()
+                if now - self._last_unknown_tick_log > 5.0:
+                    logger.warning(f"Unknown tick format keys: {list(tick_data.keys())}")
+                    self._last_unknown_tick_log = now
+                return
+
+            sid = int(sid_val)
+            ltp = float(ltp_val)
                 
-                # Extract Volume
-                volume = 0.0
-                if 'volume' in tick_data:
-                    volume = float(tick_data['volume'])
-                elif 'total_volume' in tick_data:
-                    volume = float(tick_data['total_volume'])
+            # Extract Volume
+            volume = 0.0
+            if 'volume' in tick_data:
+                volume = float(tick_data['volume'])
+            elif 'total_volume' in tick_data:
+                volume = float(tick_data['total_volume'])
                 
-                # Get symbol from reverse mapping
-                symbol = self.id_map.get(sid)
-                if symbol:
-                    try:
-                        # Call callback directly for low latency
-                        callback(symbol, ltp, volume)
+            # Get symbol from reverse mapping
+            symbol = self.id_map.get(sid)
+            if symbol and symbol.endswith("-EQ"):
+                symbol = symbol[:-3]
+            if symbol:
+                try:
+                    # Call callback directly for low latency
+                    callback(symbol, ltp, volume)
+                    
+                    self._tick_count += 1
+                    now = time.time()
+                    if now - self._last_tick_log > 10.0:
+                        logger.info(f"Ticks received: {self._tick_count} (last: {symbol} {ltp})")
+                        self._last_tick_log = now
+                    
+                    # Record performance
+                    latency_ms = (time.time() - start_time) * 1000
+                    if latency_ms > 10:  # Log only if > 10ms
+                        logger.debug(f"Tick processing took {latency_ms:.2f}ms")
                         
-                        # Record performance
-                        latency_ms = (time.time() - start_time) * 1000
-                        if latency_ms > 10:  # Log only if > 10ms
-                            logger.debug(f"Tick processing took {latency_ms:.2f}ms")
-                            
-                    except TypeError:
-                        # Fallback for old signature
-                        callback(symbol, ltp)
+                except TypeError:
+                    # Fallback for old signature
+                    callback(symbol, ltp)
                     
         except Exception as e:
             logger.error(f"Tick processing error: {e}")
@@ -491,6 +693,107 @@ class DhanClientWrapper:
         except Exception as e:
             logger.error(f"Failed to fetch positions: {e}")
             return []
+
+    def get_top_movers(self, symbols, top_n_gainers=5, top_n_losers=5, exchange_segment="NSE_EQ"):
+        """
+        Fetch LTP/prev close via REST and compute top gainers/losers.
+        Uses batching (100 instruments per request) to respect API limits.
+        """
+        if not self.is_connected:
+            return {"gainers": [], "losers": [], "errors": ["Not connected"]}
+
+        if not self.ensure_security_mapping_loaded():
+            return {"gainers": [], "losers": [], "errors": ["Security master not loaded"]}
+
+        # Map symbols to security IDs
+        security_ids = []
+        for s in symbols:
+            sid = self.get_security_id(s)
+            if sid:
+                security_ids.append(int(sid))
+            else:
+                logger.debug(f"Top movers: no security id for {s}")
+
+        if not security_ids:
+            return {"gainers": [], "losers": [], "errors": ["No valid security ids"]}
+
+        def _iter_batches(items, size=100):
+            for i in range(0, len(items), size):
+                yield items[i:i + size]
+
+        movers = []
+        errors = []
+
+        for batch in _iter_batches(security_ids, 100):
+            try:
+                response = self.dhan.ohlc_data({exchange_segment: batch})
+            except Exception as e:
+                errors.append(str(e))
+                continue
+
+            if not response or response.get("status") != "success":
+                errors.append(str(response))
+                continue
+
+            data = response.get("data", {})
+            segment_data = data.get(exchange_segment, data)
+
+            # segment_data can be dict keyed by security_id or list of entries
+            if isinstance(segment_data, dict):
+                items = segment_data.items()
+            elif isinstance(segment_data, list):
+                items = [(d.get("securityId") or d.get("security_id"), d) for d in segment_data]
+            else:
+                items = []
+
+            for sid, payload in items:
+                try:
+                    if payload is None:
+                        continue
+                    sid_int = int(sid) if sid is not None else None
+                    symbol = self.id_map.get(sid_int)
+                    if not symbol:
+                        continue
+
+                    ltp = (
+                        payload.get("ltp")
+                        or payload.get("LTP")
+                        or payload.get("last_traded_price")
+                        or payload.get("last_price")
+                    )
+                    prev_close = (
+                        payload.get("prev_close")
+                        or payload.get("prevClose")
+                        or payload.get("close")
+                    )
+                    volume = payload.get("volume") or payload.get("total_volume") or 0.0
+
+                    if ltp is None or prev_close is None:
+                        continue
+
+                    ltp = float(ltp)
+                    prev_close = float(prev_close)
+                    if prev_close <= 0:
+                        continue
+
+                    change_pct = ((ltp - prev_close) / prev_close) * 100.0
+                    turnover = float(volume) * ltp if volume else 0.0
+
+                    movers.append({
+                        "symbol": symbol,
+                        "ltp": ltp,
+                        "prev_close": prev_close,
+                        "change_pct": change_pct,
+                        "turnover": turnover,
+                    })
+                except Exception:
+                    continue
+
+        movers.sort(key=lambda x: x["change_pct"], reverse=True)
+        gainers = movers[:top_n_gainers]
+        losers = list(reversed(movers[-top_n_losers:])) if movers else []
+
+        return {"gainers": gainers, "losers": losers, "errors": errors}
 
     def square_off_position(self, symbol, quantity, transaction_type):
         """Square off a position."""
