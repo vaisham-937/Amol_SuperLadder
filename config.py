@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 
 class StrategySettings(BaseModel):
@@ -9,20 +9,31 @@ class StrategySettings(BaseModel):
     # Ladder Settings
     no_of_add_ons: int = 5
     add_on_percentage: float = 0.5  # % rise/fall to add more
-    initial_stop_loss_pct: float = 0.5
-    trailing_stop_loss_pct: float = 0.5
-    target_percentage: float = 2.0
+    initial_stop_loss_pct: float = 2
+    trailing_stop_loss_pct: float = 2
+    target_percentage: float = 5
     
     # Selection Settings
-    max_ladder_stocks: int = 20
-    top_n_gainers: int = 10
-    top_n_losers: int = 10
+    max_ladder_stocks: int = 10
+    top_n_gainers: int = 5
+    top_n_losers: int = 5
     min_turnover_crores: float = 1.0
+    auto_start_market_open: bool = True
+
+    # Entry Filters / Cycles
+    max_open_gap_pct_long: float = 3.0
+    min_open_gap_pct_short: float = -3.0
+    cycles_per_stock: int = 3
     
     # Risk Management
-    trade_capital: float = 1000.0
+    trade_capital: float = 5000.0
     profit_target_per_stock: float = 5000.0
     loss_limit_per_stock: float = 2000.0
+    global_profit_exit: float = 4000.0
+    global_loss_exit: float = 2000.0
+
+    # Performance
+    max_concurrent_orders: int = 10
     
     # State
     is_active: bool = False
@@ -47,10 +58,18 @@ class StockStatus(BaseModel):
     stop_loss: float
     target: float
     prev_close: float = 0.0
+    day_open: float = 0.0
+    open_gap_pct: float = 0.0
+    last_volume: float = 0.0  # Latest tick volume (as provided by Dhan feed)
     turnover: float = 0.0
     high_watermark: float = 0.0  # For trailing SL tracking
-    order_ids: List[str] = []  # Track all orders for this position
+    order_ids: List[str] = Field(default_factory=list)  # Track all orders for this position
     avg_entry_price: float = 0.0  # Average entry price for accurate P&L
+    pending_order: str = ""  # Tracks in-flight order intent (prevents duplicate orders)
+    last_order_error: str = ""
+    cycle_index: int = 0
+    cycle_total: int = 1
+    cycle_start_mode: str = ""
 
 class PerformanceSettings(BaseModel):
     """Performance and optimization settings."""

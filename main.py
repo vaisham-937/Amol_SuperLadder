@@ -7,8 +7,10 @@ import asyncio
 import json
 import logging
 import sys
+from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from datetime import timedelta
 
 from config import StrategySettings
 from credentials_store import load_credentials, save_credentials
@@ -33,6 +35,16 @@ root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 root_logger.handlers = [handler]
 logger = logging.getLogger("Main")
+
+class _DropNoisyAccessLog(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return "/api/cache/warm/status" not in msg
+
+logging.getLogger("uvicorn.access").addFilter(_DropNoisyAccessLog())
 
 app = FastAPI(title="Dhan Ladder Algo")
 
@@ -76,7 +88,11 @@ manager = ConnectionManager()
 async def broadcast_status():
     while True:
         try:
-            positions = [s.dict() for s in engine.active_stocks.values() if s.mode != "NONE"]
+            positions = [
+                s.dict()
+                for s in engine.active_stocks.values()
+                if s.mode != "NONE" or str(getattr(s, "status", "")).startswith("PENDING")
+            ]
             # Construct Status JSON (keep payload small for smooth UI)
             status_data = {
                 "positions": positions,
@@ -84,6 +100,7 @@ async def broadcast_status():
                 "total_stocks": len(engine.active_stocks),
                 "global_pnl": engine.pnl_global,
                 "is_running": engine.running,
+                "armed_for_market_open": getattr(engine, "armed_for_market_open", False),
                 "dhan_connected": dhan.is_connected,
                 "market_open": engine.is_market_hours(),
                 "performance": perf_monitor.get_all_metrics() if perf_monitor.enabled else {}
@@ -99,6 +116,64 @@ async def startup_event():
     # Start performance logging
     if perf_monitor.enabled:
         asyncio.create_task(perf_monitor.periodic_logging(interval_seconds=60))
+
+    async def _warmup():
+        """Preload cached resources (security master, filtered candidates)."""
+        if not dhan.is_connected:
+            return
+        try:
+            await asyncio.to_thread(dhan.ensure_security_mapping_loaded)
+        except Exception as e:
+            logger.error(f"Warmup: security master failed: {e}")
+        try:
+            await asyncio.to_thread(engine.load_filtered_stocks)
+        except Exception as e:
+            logger.error(f"Warmup: filtered stocks load failed: {e}")
+
+    async def _auto_start_at_market_open():
+        """Arm and start engine right at 09:15 IST if configured/armed."""
+        while True:
+            try:
+                now = datetime.now(IST)
+                open_dt = now.replace(hour=9, minute=15, second=0, microsecond=0)
+                if now >= open_dt:
+                    # If already past market open, check again later.
+                    await asyncio.sleep(60)
+                    continue
+
+                # Warmup 90s before open.
+                warmup_at = open_dt - timedelta(seconds=90)
+                delay = max(0.0, (warmup_at - now).total_seconds())
+                await asyncio.sleep(delay)
+                await _warmup()
+
+                # Sleep until market open.
+                now2 = datetime.now(IST)
+                delay2 = max(0.0, (open_dt - now2).total_seconds())
+                await asyncio.sleep(delay2)
+
+                if engine.running:
+                    continue
+
+                if not (getattr(engine.settings, "auto_start_market_open", True) or getattr(engine, "armed_for_market_open", False)):
+                    continue
+
+                if not dhan.is_connected:
+                    logger.error("Auto-start: Dhan not connected at market open")
+                    continue
+
+                candidates_map = engine.load_filtered_stocks()
+                if not candidates_map:
+                    logger.error("Auto-start: No filtered stocks available at market open")
+                    continue
+
+                logger.info("Auto-start: Starting engine at market open (09:15 IST)")
+                engine.armed_for_market_open = False
+                asyncio.create_task(engine.start_strategy())
+            except Exception as e:
+                logger.error(f"Auto-start loop error: {e}", exc_info=True)
+                await asyncio.sleep(5)
+
     # Auto-connect if saved credentials exist (do not block app startup)
     async def _auto_connect_saved():
         saved_client_id, saved_access_token = load_credentials()
@@ -120,15 +195,25 @@ async def startup_event():
             )
             engine.update_settings(merged)
             logger.info("✅ Auto-connected to Dhan using saved credentials")
+            asyncio.create_task(_warmup())
         else:
             logger.error(f"Auto-connect failed: {msg}")
 
     asyncio.create_task(_auto_connect_saved())
+    asyncio.create_task(_auto_start_at_market_open())
 
 # Routes
 @app.get("/")
 async def get_dashboard(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    app_js_version = None
+    try:
+        app_js_version = int(Path("static/app.js").stat().st_mtime_ns)
+    except Exception:
+        app_js_version = int(datetime.now().timestamp())
+    return templates.TemplateResponse(
+        "index.html",
+        {"request": request, "app_js_version": app_js_version},
+    )
 
 @app.post("/api/login")
 async def login_dhan(settings: StrategySettings):
@@ -159,6 +244,31 @@ async def update_settings(settings: StrategySettings):
         msg = "Settings saved and Dhan connected"
     return {"status": "success", "message": msg, "settings": settings.dict()}
 
+@app.post("/api/warmup")
+async def warmup():
+    """Warm up cached resources (security master, filtered candidates)."""
+    if not dhan.is_connected:
+        return {"status": "error", "message": "Dhan not connected"}
+    try:
+        await asyncio.to_thread(dhan.ensure_security_mapping_loaded)
+        await asyncio.to_thread(engine.load_filtered_stocks)
+        return {"status": "success", "message": "Warmup complete"}
+    except Exception as e:
+        logger.error(f"Warmup failed: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+@app.get("/api/cache/warm/status", include_in_schema=False)
+async def cache_warm_status_compat():
+    """
+    Compatibility endpoint for older frontends/tools that used to poll this path.
+    Backtesting is removed; keep this to avoid noisy 404s.
+    """
+    return {
+        "status": "deprecated",
+        "message": "Deprecated endpoint. Use /api/status and /api/warmup.",
+        "dhan_connected": dhan.is_connected,
+    }
+
 @app.post("/api/start")
 async def start_engine():
     """Start the trading engine."""
@@ -172,7 +282,11 @@ async def start_engine():
             return {"status": "already_running", "message": "Engine is already running"}
 
         if not engine.is_market_hours():
-            return {"status": "error", "message": "Market closed (IST). Engine will not start WebSocket feed."}
+            engine.armed_for_market_open = True
+            return {
+                "status": "armed",
+                "message": "Market closed (IST). Engine armed; will auto-start at 09:15 IST.",
+            }
 
         # Ensure we have candidates, otherwise the engine will start and immediately stop.
         candidates_map = engine.load_filtered_stocks()
@@ -193,7 +307,7 @@ async def start_engine():
 @app.post("/api/stop")
 async def stop_engine():
     """Stop the trading engine."""
-    engine.running = False
+    engine.stop("Stopped by user")
     dhan.stop_feed()
     return {"status": "Stopped"}
 
@@ -226,14 +340,14 @@ async def emergency_square_off():
     
     try:
         await engine.square_off_all()
-        return {"status": "success", "message": "All positions squared off"}
+        return {"status": "success", "message": "Square-off queued"}
     except Exception as e:
         logger.error(f"Square-off failed: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.post("/api/close-position/{symbol}")
 async def close_single_position(symbol: str):
-    """Close a specific position."""
+    """Close/square-off a specific ladder (compat endpoint)."""
     if symbol not in engine.active_stocks:
         return {"status": "error", "message": "Stock not found"}
     
@@ -242,11 +356,25 @@ async def close_single_position(symbol: str):
         return {"status": "error", "message": "No active position"}
     
     try:
-        engine.close_position(stock, "Manual Close")
-        stock.status = "CLOSED_MANUAL"
-        return {"status": "success", "message": f"{symbol} position closed"}
+        engine.square_off_symbol(symbol, reason="Manual Square-off", final_status="CLOSED_MANUAL")
+        return {"status": "success", "message": f"{symbol} square-off queued"}
     except Exception as e:
         logger.error(f"Failed to close {symbol}: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/square-off/{symbol}")
+async def square_off_symbol(symbol: str):
+    """Square-off all positions for a single ladder and mark it closed."""
+    if symbol not in engine.active_stocks:
+        return {"status": "error", "message": "Stock not found"}
+    stock = engine.active_stocks[symbol]
+    if stock.mode == "NONE":
+        return {"status": "error", "message": "No active position"}
+    try:
+        engine.square_off_symbol(symbol, reason="Manual Square-off", final_status="CLOSED_MANUAL")
+        return {"status": "success", "message": f"{symbol} square-off queued"}
+    except Exception as e:
+        logger.error(f"Square-off failed for {symbol}: {e}")
         return {"status": "error", "message": str(e)}
 
 @app.get("/api/metrics")

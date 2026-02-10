@@ -73,8 +73,12 @@ def save_candidates(candidates: Dict[str, float], metadata: Dict) -> bool:
             "criteria": metadata.get("criteria"),
             "total_stocks_screened": metadata.get("total_stocks_screened"),
             "stocks_accepted": metadata.get("stocks_accepted"),
+            "stock_list_count": metadata.get("stock_list_count"),
+            "stock_list_hash": metadata.get("stock_list_hash"),
             "candidates": candidates,
         }
+        if isinstance(metadata.get("volume_sma_by_symbol"), dict) and metadata.get("volume_sma_by_symbol"):
+            payload["volume_sma_by_symbol"] = metadata.get("volume_sma_by_symbol")
         r.set(today_key, json.dumps(payload))
         r.set("dhan:premarket:candidates:latest", today_key)
         r.expire(today_key, _seconds_until_end_of_day_ist())

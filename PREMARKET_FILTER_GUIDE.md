@@ -53,6 +53,18 @@ python premarket_filter.py
 - Applies volume SMA filter: `(sum of last 5 days volume / 1875) > 2000`
 - Saves accepted candidates to `filtered_stocks.json`
 - Shows detailed progress and summary
+- Saves the same-day results to Redis (so repeated runs can reuse the cache)
+
+**Re-run behavior (same day):**
+- By default, the script will **reuse today’s cached candidates from Redis** if available.
+- To **rescreen all stocks** (ignore Redis cache), run:
+  ```bash
+  python premarket_filter.py --force
+  ```
+
+**Rate limiting:**
+- Defaults are tuned to be conservative (`--rate 3`, `--connections 5`, `--in-flight 5`).
+- If Dhan returns `DH-904 Rate_Limit`, the client will automatically cool down and retry (run time may increase).
 
 **Expected output:**
 ```

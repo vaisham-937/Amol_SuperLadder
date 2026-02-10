@@ -64,6 +64,8 @@ async function startStrategy() {
         const data = await res.json();
         if (data.status === 'success') {
             addLog('▶️ ' + data.message);
+        } else if (data.status === 'armed') {
+            addLog('⏰ ' + data.message);
         } else {
             addLog('❌ ' + (data.message || data.status));
         }
@@ -141,13 +143,13 @@ async function squareOffAll() {
     }
 }
 
-async function closePosition(symbol) {
-    if (!confirm(`Close position for ${symbol}?`)) {
+async function squareOffLadder(symbol) {
+    if (!confirm(`Square-off ladder for ${symbol}?`)) {
         return;
     }
 
     try {
-        const res = await fetch(`/api/close-position/${symbol}`, { method: 'POST' });
+        const res = await fetch(`/api/square-off/${symbol}`, { method: 'POST' });
         const data = await res.json();
         addLog(`📊 ${data.message}`);
     } catch (e) {
@@ -176,8 +178,11 @@ function updateSettingsFromUI(obj) {
     obj.target_percentage = parseFloat(getVal('targetPct'));
     obj.trade_capital = parseFloat(getVal('capital'));
     obj.max_ladder_stocks = Math.max(1, parseInt(getVal('maxLadderStocks') || 20));
+    obj.max_concurrent_orders = Math.min(10, Math.max(1, parseInt(getVal('maxConcurrentOrders') || 2)));
     obj.profit_target_per_stock = parseFloat(getVal('stockProfitTarget'));
     obj.loss_limit_per_stock = parseFloat(getVal('stockLossLimit'));
+    obj.global_profit_exit = parseFloat(getVal('globalProfitExit') || 0);
+    obj.global_loss_exit = parseFloat(getVal('globalLossExit') || 0);
     obj.top_n_gainers = parseInt(getVal('topGainers') || 5);
     obj.top_n_losers = parseInt(getVal('topLosers') || 5);
     obj.min_turnover_crores = parseFloat(getVal('minTurnover') || 1.0);
@@ -213,10 +218,13 @@ function loadSettingsFromLocalStorage() {
             if (settings.initial_stop_loss_pct !== undefined) setVal('initSLPct', settings.initial_stop_loss_pct);
             if (settings.trailing_stop_loss_pct !== undefined) setVal('tslPct', settings.trailing_stop_loss_pct);
             if (settings.target_percentage !== undefined) setVal('targetPct', settings.target_percentage);
+            if (settings.max_concurrent_orders !== undefined) setVal('maxConcurrentOrders', settings.max_concurrent_orders);
             if (settings.trade_capital !== undefined) setVal('capital', settings.trade_capital);
             if (settings.max_ladder_stocks !== undefined) setVal('maxLadderStocks', settings.max_ladder_stocks);
             if (settings.profit_target_per_stock !== undefined) setVal('stockProfitTarget', settings.profit_target_per_stock);
             if (settings.loss_limit_per_stock !== undefined) setVal('stockLossLimit', settings.loss_limit_per_stock);
+            if (settings.global_profit_exit !== undefined) setVal('globalProfitExit', settings.global_profit_exit);
+            if (settings.global_loss_exit !== undefined) setVal('globalLossExit', settings.global_loss_exit);
             if (settings.top_n_gainers !== undefined) setVal('topGainers', settings.top_n_gainers);
             if (settings.top_n_losers !== undefined) setVal('topLosers', settings.top_n_losers);
             if (settings.min_turnover_crores !== undefined) setVal('minTurnover', settings.min_turnover_crores);
@@ -294,19 +302,34 @@ async function fetchTopMovers() {
             return;
         }
 
-        const gainers = (data.gainers || [])
-            .map(s => `${s.symbol} ${formatPercent(s.change_pct)}`)
-            .slice(0, 5)
-            .join(', ');
-        const losers = (data.losers || [])
-            .map(s => `${s.symbol} ${formatPercent(s.change_pct)}`)
-            .slice(0, 5)
-            .join(', ');
+        const gainers = (data.gainers || []).slice(0, 10);
+        const losers = (data.losers || []).slice(0, 10);
 
-        const gainersEl = document.getElementById('topGainersApi');
-        const losersEl = document.getElementById('topLosersApi');
-        if (gainersEl) gainersEl.textContent = gainers || '-';
-        if (losersEl) losersEl.textContent = losers || '-';
+        const gainersEl = document.getElementById('topGainersList');
+        const losersEl = document.getElementById('topLosersList');
+        if (!gainersEl || !losersEl) return;
+
+        const render = (arr) => {
+            if (!arr.length) return '-';
+            return arr.map(s => {
+                const ch = Number(s.change_pct || 0);
+                const color = getPercentColor(ch);
+                const turnover = Number(s.turnover || 0);
+                return `
+                    <div class="mover-row">
+                        <div class="mover-symbol">${s.symbol || '-'}</div>
+                        <div class="mover-change" style="color:${color}">${formatPercent(ch)}</div>
+                        <div class="mover-meta">
+                            <span>Turnover</span>
+                            <span>${formatTurnover(turnover)}</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+        };
+
+        gainersEl.innerHTML = render(gainers);
+        losersEl.innerHTML = render(losers);
     } catch (e) {
         console.error('Top movers fetch failed:', e);
     }
@@ -398,7 +421,7 @@ function connectWebSocket() {
                 <td><span class="status-badge status-${stock.status.toLowerCase()}">${stock.status}</span></td>
                 <td>
                     ${stock.mode !== 'NONE' ?
-                    `<button class="btn-small btn-danger" onclick="closePosition('${stock.symbol}')">Close</button>` :
+                    `<button class="btn-small btn-danger" onclick="squareOffLadder('${stock.symbol}')">Square Off</button>` :
                     '-'}
                 </td>
             `;
@@ -472,6 +495,7 @@ try {
 } catch (e) { }
 
 connectWebSocket();
+fetchTopMovers();
 
 // Periodic health check
 setInterval(async () => {
@@ -486,9 +510,7 @@ setInterval(async () => {
     }
 }, 30000); // Every 30 seconds
 
-// Periodic top movers refresh (closed market or no ticks)
+// Periodic top movers refresh
 setInterval(() => {
-    if (marketOpenState === false) {
-        fetchTopMovers();
-    }
+    fetchTopMovers();
 }, 60000);

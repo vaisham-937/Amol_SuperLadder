@@ -36,10 +36,10 @@ def test_imports():
         from performance_monitor import perf_monitor
         from main import app
         
-        logger.info("✅ All imports successful")
+        logger.info("PASS: All imports successful")
         return True
     except ImportError as e:
-        logger.error(f"❌ Import error: {e}")
+        logger.error(f"FAIL: Import error: {e}")
         return False
 
 def test_config():
@@ -80,10 +80,10 @@ def test_config():
         perf_settings = PerformanceSettings()
         assert perf_settings.tick_batch_interval_ms == 100
         
-        logger.info("✅ Configuration models working correctly")
+        logger.info("PASS: Configuration models working correctly")
         return True
     except Exception as e:
-        logger.error(f"❌ Config test failed: {e}")
+        logger.error(f"FAIL: Config test failed: {e}")
         return False
 
 def test_performance_monitor():
@@ -115,10 +115,10 @@ def test_performance_monitor():
         assert 'cpu_percent' in system_stats
         assert 'memory_mb' in system_stats
         
-        logger.info("✅ Performance monitor working correctly")
+        logger.info("PASS: Performance monitor working correctly")
         return True
     except Exception as e:
-        logger.error(f"❌ Performance monitor test failed: {e}")
+        logger.error(f"FAIL: Performance monitor test failed: {e}")
         return False
 
 def test_order_manager():
@@ -161,10 +161,10 @@ def test_order_manager():
         assert summary['total_orders'] == 1
         assert summary['executed'] == 1
         
-        logger.info("✅ Order manager working correctly")
+        logger.info("PASS: Order manager working correctly")
         return True
     except Exception as e:
-        logger.error(f"❌ Order manager test failed: {e}")
+        logger.error(f"FAIL: Order manager test failed: {e}")
         return False
 
 def test_dhan_client_structure():
@@ -181,10 +181,10 @@ def test_dhan_client_structure():
         assert hasattr(client, 'subscribe')
         assert hasattr(client, 'place_order')
         
-        logger.info("✅ Dhan client structure valid")
+        logger.info("PASS: Dhan client structure valid")
         return True
     except Exception as e:
-        logger.error(f"❌ Dhan client test failed: {e}")
+        logger.error(f"FAIL: Dhan client test failed: {e}")
         return False
 
 def test_strategy_engine_structure():
@@ -205,10 +205,10 @@ def test_strategy_engine_structure():
         assert hasattr(engine, 'start_short_ladder')
         assert hasattr(engine, 'calculate_pnl')
         
-        logger.info("✅ Strategy engine structure valid")
+        logger.info("PASS: Strategy engine structure valid")
         return True
     except Exception as e:
-        logger.error(f"❌ Strategy engine test failed: {e}")
+        logger.error(f"FAIL: Strategy engine test failed: {e}")
         return False
 
 def test_api_structure():
@@ -216,7 +216,6 @@ def test_api_structure():
     logger.info("Testing API structure...")
     try:
         from main import app
-        from fastapi.testclient import TestClient
         
         # Check routes exist
         routes = [route.path for route in app.routes]
@@ -227,14 +226,19 @@ def test_api_structure():
         assert "/api/status" in routes
         assert "/api/positions" in routes
         assert "/api/square-off-all" in routes
+        assert "/api/square-off/{symbol}" in routes
+        assert "/api/cache/warm/status" in routes
+        assert "/api/close-position/{symbol}" in routes
+        assert "/api/warmup" in routes
         assert "/api/metrics" in routes
+        assert "/api/top-movers" in routes
         assert "/api/health" in routes
         assert "/ws" in routes
         
-        logger.info("✅ API structure valid")
+        logger.info("PASS: API structure valid")
         return True
     except Exception as e:
-        logger.error(f"❌ API test failed: {e}")
+        logger.error(f"FAIL: API test failed: {e}")
         return False
 
 def run_all_tests():
@@ -272,14 +276,14 @@ def run_all_tests():
     total = len(results)
     
     for test_name, result in results:
-        status = "✅ PASS" if result else "❌ FAIL"
+        status = "PASS" if result else "FAIL"
         logger.info(f"{status} - {test_name}")
     
     logger.info(f"\nTotal: {passed}/{total} tests passed")
     
     if passed == total:
-        logger.info("\n🎉 All tests passed! Application is ready for deployment.")
-        logger.info("\n📋 Next Steps:")
+        logger.info("\nAll tests passed! Application is ready.")
+        logger.info("\nNext Steps:")
         logger.info("1. Start the application: python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000")
         logger.info("2. Open dashboard: http://localhost:8000")
         logger.info("3. Enter Dhan credentials and connect")
@@ -287,7 +291,7 @@ def run_all_tests():
         logger.info("5. Start the algo with small capital for testing")
         return True
     else:
-        logger.error("\n❌ Some tests failed. Please fix issues before proceeding.")
+        logger.error("\nSome tests failed. Please fix issues before proceeding.")
         return False
 
 if __name__ == "__main__":

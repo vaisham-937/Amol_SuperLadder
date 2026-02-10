@@ -11,7 +11,7 @@ import threading
 import asyncio
 from functools import lru_cache
 from collections import deque
-import ujson
+from pathlib import Path
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
@@ -35,17 +35,68 @@ class RateLimiter:
             max_requests_per_second: Maximum API requests per second (default: 1)
             max_connections: Maximum concurrent connections (default: 5)
         """
+        try:
+            max_requests_per_second = float(max_requests_per_second)
+        except Exception:
+            max_requests_per_second = 1.0
+        try:
+            max_connections = int(max_connections)
+        except Exception:
+            max_connections = 5
+
+        if max_requests_per_second <= 0:
+            logger.warning(f"Invalid max_requests_per_second={max_requests_per_second}; using 1.0")
+            max_requests_per_second = 1.0
+        if max_connections <= 0:
+            logger.warning(f"Invalid max_connections={max_connections}; using 5")
+            max_connections = 5
+
         self.max_requests_per_second = max_requests_per_second
         self.max_connections = max_connections
-        self.tokens = max_requests_per_second
+
+        # Avoid an initial burst (token bucket starts empty).
+        self.tokens = 0.0
         self.last_update = time.time()
         self.lock = threading.Lock()
         self.active_connections = 0
         self.connection_lock = threading.Lock()
+
+        # Temporary server-rate-limit penalty window.
+        self._penalty_until = 0.0
+        self._penalty_rps = None
         
         logger.info(f"RateLimiter initialized: {max_requests_per_second} req/sec, {max_connections} max connections")
+
+    def penalize(self, cooldown_seconds: float = 10.0, penalty_rps: float = None) -> None:
+        """Temporarily reduce effective request rate after server rate-limit responses."""
+        try:
+            cooldown_seconds = float(cooldown_seconds)
+        except Exception:
+            cooldown_seconds = 10.0
+        if cooldown_seconds <= 0:
+            return
+
+        now = time.time()
+        with self.lock:
+            self._penalty_until = max(self._penalty_until, now + cooldown_seconds)
+            if penalty_rps is not None:
+                try:
+                    penalty_rps = float(penalty_rps)
+                except Exception:
+                    penalty_rps = None
+            if penalty_rps is not None and penalty_rps > 0:
+                if self._penalty_rps is None:
+                    self._penalty_rps = penalty_rps
+                else:
+                    self._penalty_rps = min(self._penalty_rps, penalty_rps)
+
+    def _effective_rps(self, now: float) -> float:
+        rps = float(self.max_requests_per_second)
+        if now < float(self._penalty_until) and self._penalty_rps is not None:
+            rps = min(rps, float(self._penalty_rps))
+        return max(0.0001, rps)
     
-    def acquire(self, retry_on_limit=True, max_retries=3):
+    def acquire(self, retry_on_limit=True, max_retries=3, max_wait_seconds=None):
         """
         Acquire a token to make an API request.
         Blocks until a token is available.
@@ -53,21 +104,24 @@ class RateLimiter:
         Args:
             retry_on_limit: Whether to retry on rate limit
             max_retries: Maximum number of retries
+            max_wait_seconds: Maximum total wait time (None = no limit)
         
         Returns:
             True if token acquired, False if max retries exceeded
         """
         retries = 0
-        
-        while retries < max_retries:
+        start = time.time()
+
+        # If max_retries is None, we wait indefinitely (subject to max_wait_seconds if set).
+        while True:
             with self.lock:
-                # Refill tokens based on time elapsed
                 now = time.time()
+                rps = self._effective_rps(now)
+
+                # Refill tokens based on time elapsed
                 elapsed = now - self.last_update
-                self.tokens = min(
-                    self.max_requests_per_second,
-                    self.tokens + elapsed * self.max_requests_per_second
-                )
+                # Keep bucket capacity at 1 to avoid bursts (smooth request spacing).
+                self.tokens = min(1.0, self.tokens + elapsed * rps)
                 self.last_update = now
                 
                 # Check if we have a token available
@@ -76,19 +130,27 @@ class RateLimiter:
                     return True
                 
                 # Calculate wait time
-                wait_time = (1.0 - self.tokens) / self.max_requests_per_second
+                wait_time = (1.0 - self.tokens) / rps
             
             # If not retrying, return False
             if not retry_on_limit:
                 return False
+
+            if max_wait_seconds is not None and (time.time() - start) >= float(max_wait_seconds):
+                logger.warning(f"Rate limiter wait exceeded {max_wait_seconds}s")
+                return False
+
+            if max_retries is not None and retries >= int(max_retries):
+                logger.warning(f"Max retries ({max_retries}) exceeded for rate limiter")
+                return False
             
             # Wait and retry
-            logger.debug(f"Rate limit reached, waiting {wait_time:.2f}s (attempt {retries + 1}/{max_retries})")
+            limit_label = "∞" if max_retries is None else str(max_retries)
+            logger.debug(
+                f"Rate limit reached, waiting {wait_time:.2f}s (attempt {retries + 1}/{limit_label})"
+            )
             time.sleep(wait_time)
             retries += 1
-        
-        logger.warning(f"Max retries ({max_retries}) exceeded for rate limiter")
-        return False
     
     def acquire_connection(self):
         """Acquire a connection slot. Blocks until available."""
@@ -143,6 +205,12 @@ class DhanClientWrapper:
         self._tick_count = 0
         self._last_tick_log = 0.0
         self._last_unknown_tick_log = 0.0
+        self._mapping_lock = threading.Lock()
+        self._security_master_refresh_attempted = False
+
+        # Security master cache (avoid re-downloading CSV on every run)
+        self._security_master_cache_path = Path(__file__).resolve().parent / "security_master_nse_eq_cache.json"
+        self._security_master_cache_max_age_days = 7
 
     @staticmethod
     def _extract_client_id_from_token(access_token: str):
@@ -206,46 +274,97 @@ class DhanClientWrapper:
 
     def fetch_security_mapping(self):
         """Fetches Dhan Scrip Master to map symbols to Security IDs."""
+        with self._mapping_lock:
+            try:
+                if self._try_load_security_master_cache():
+                    return
+
+                url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+                logger.info("Fetching Security Master CSV...")
+                
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                r = requests.get(url, headers=headers, timeout=30)
+                r.raise_for_status()
+                
+                df = pd.read_csv(io.StringIO(r.text))
+                
+                # Filter for NSE Equity
+                equity_df = df[
+                    (df['SEM_EXM_EXCH_ID'] == 'NSE') & 
+                    (df['SEM_INSTRUMENT_NAME'] == 'EQUITY')
+                ]
+                
+                if equity_df.empty:
+                    logger.warning("No NSE Equity records found, trying broad filter")
+                    equity_df = df
+                
+                # Create symbol mapping
+                self.symbol_map = dict(zip(
+                    equity_df['SEM_TRADING_SYMBOL'], 
+                    equity_df['SEM_SMST_SECURITY_ID']
+                ))
+                
+                logger.info(f"Loaded {len(self.symbol_map)} security mappings")
+                self._save_security_master_cache()
+                
+            except Exception as e:
+                logger.error(f"Failed to fetch Security Master: {e}")
+
+    def _try_load_security_master_cache(self) -> bool:
+        """Load cached NSE_EQ security master mapping if fresh enough."""
         try:
-            url = "https://images.dhan.co/api-data/api-scrip-master.csv"
-            logger.info("Fetching Security Master CSV...")
-            
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-            r = requests.get(url, headers=headers, timeout=30)
-            r.raise_for_status()
-            
-            df = pd.read_csv(io.StringIO(r.text))
-            
-            # Filter for NSE Equity
-            equity_df = df[
-                (df['SEM_EXM_EXCH_ID'] == 'NSE') & 
-                (df['SEM_INSTRUMENT_NAME'] == 'EQUITY')
-            ]
-            
-            if equity_df.empty:
-                logger.warning("No NSE Equity records found, trying broad filter")
-                equity_df = df
-            
-            # Create symbol mapping
-            self.symbol_map = dict(zip(
-                equity_df['SEM_TRADING_SYMBOL'], 
-                equity_df['SEM_SMST_SECURITY_ID']
-            ))
-            
-            logger.info(f"Loaded {len(self.symbol_map)} security mappings")
-            
+            if not self._security_master_cache_path.exists():
+                return False
+
+            age_seconds = time.time() - self._security_master_cache_path.stat().st_mtime
+            max_age_seconds = self._security_master_cache_max_age_days * 86400
+            if age_seconds > max_age_seconds:
+                return False
+
+            raw = self._security_master_cache_path.read_text(encoding="utf-8")
+            payload = json.loads(raw) if raw else {}
+            symbol_map = payload.get("symbol_map") or {}
+            if not isinstance(symbol_map, dict) or not symbol_map:
+                return False
+
+            self.symbol_map = symbol_map
+            logger.info(
+                f"Loaded security master mapping from cache ({len(self.symbol_map)} symbols)"
+            )
+            return True
         except Exception as e:
-            logger.error(f"Failed to fetch Security Master: {e}")
+            logger.debug(f"Security master cache load failed: {e}")
+            return False
+
+    def _save_security_master_cache(self) -> None:
+        """Persist current symbol_map to disk for faster next startup."""
+        try:
+            if not self.symbol_map:
+                return
+            payload = {
+                "saved_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                "symbol_map": self.symbol_map,
+            }
+            self._security_master_cache_path.write_text(
+                json.dumps(payload), encoding="utf-8"
+            )
+        except Exception as e:
+            logger.debug(f"Security master cache save failed: {e}")
 
     def ensure_security_mapping_loaded(self) -> bool:
         """Ensure symbol/security-id mappings are available (fetch lazily if missing)."""
+        if self.symbol_map and self.id_map:
+            return True
+
         if not self.symbol_map:
             self.fetch_security_mapping()
-        if self.symbol_map and not self.id_map:
-            self._build_reverse_mapping()
-        return bool(self.symbol_map)
+
+        with self._mapping_lock:
+            if self.symbol_map and not self.id_map:
+                self._build_reverse_mapping()
+            return bool(self.symbol_map)
 
     def _build_reverse_mapping(self):
         """Build reverse mapping for O(1) lookups."""
@@ -256,6 +375,10 @@ class DhanClientWrapper:
     @lru_cache(maxsize=1000)
     def get_security_id(self, symbol):
         """Returns Security ID for a symbol as an integer (cached)."""
+        symbol = str(symbol).strip().upper()
+        if not symbol:
+            return None
+
         # Try direct match
         if symbol in self.symbol_map:
             return int(self.symbol_map[symbol])
@@ -590,48 +713,122 @@ class DhanClientWrapper:
             return None
 
         try:
-            # Acquire rate limit token
-            if not self.rate_limiter.acquire():
-                logger.error(f"Rate limit exceeded for {symbol}, skipping")
+            symbol = str(symbol).strip().upper()
+            if not symbol:
                 return None
-            
-            # Acquire connection slot
-            self.rate_limiter.acquire_connection()
-            
-            try:
-                end_date = datetime.now().date()
-                start_date = end_date - timedelta(days=days)
-                
+
+            # Ensure we have security-id mapping (may have been skipped during connect)
+            if not self.ensure_security_mapping_loaded():
+                logger.error("Security master mapping not loaded (cannot fetch historical data)")
+                return None
+
+            security_id = self.get_security_id(symbol)
+            if not security_id and not self._security_master_refresh_attempted:
+                # Best-effort refresh once (handles stale/partial cache)
+                self._security_master_refresh_attempted = True
+                self.fetch_security_mapping()
+                self.ensure_security_mapping_loaded()
                 security_id = self.get_security_id(symbol)
-                if not security_id:
-                    logger.error(f"Security ID not found for {symbol}")
+
+            if not security_id:
+                logger.warning(f"Security ID not found for {symbol}")
+                return None
+
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=days)
+
+            def _is_server_rate_limit(resp) -> bool:
+                if not isinstance(resp, dict):
+                    return False
+                if resp.get("status") != "failure":
+                    return False
+                remarks = resp.get("remarks") or {}
+                data = resp.get("data") or {}
+                code = remarks.get("error_code") or data.get("errorCode")
+                etype = remarks.get("error_type") or data.get("errorType") or ""
+                msg = remarks.get("error_message") or data.get("errorMessage") or ""
+                if str(code).strip().upper() == "DH-904":
+                    return True
+                if "RATE_LIMIT" in str(etype).strip().upper():
+                    return True
+                if "rate limit" in str(msg).lower():
+                    return True
+                return False
+
+            attempt = 0
+            backoff_seconds = 1.0
+            max_attempts = 12
+
+            while True:
+                attempt += 1
+
+                # Acquire rate limit token (wait instead of skipping)
+                if not self.rate_limiter.acquire(max_retries=None):
+                    logger.error(f"Rate limiter could not acquire token for {symbol}")
                     return None
-                
-                # DEBUG: Log what we're about to send
-                logger.debug(f"Fetching history for {symbol}: security_id={security_id} (type={type(security_id).__name__})")
-                
-                # According to Dhan SDK documentation:
-                # exchange_segment should be string: "NSE_EQ", "BSE_EQ", etc.
-                # NOT integer
-                response = self.dhan.historical_daily_data(
-                    security_id=str(security_id),  # SDK expects string
-                    exchange_segment=exchange_segment,  # Use string like "NSE_EQ"
-                    instrument_type="EQUITY",
-                    from_date=start_date.strftime("%Y-%m-%d"),
-                    to_date=end_date.strftime("%Y-%m-%d")
-                )
-                
-                if response.get('status') == 'success':
-                    data = response.get('data')
-                    df = pd.DataFrame(data)
-                    return df
-                else:
-                    logger.error(f"Failed to fetch history for {symbol}: {response}")
-                    return None
-                    
-            finally:
-                # Always release connection
-                self.rate_limiter.release_connection()
+
+                # Acquire connection slot
+                self.rate_limiter.acquire_connection()
+
+                try:
+                    # DEBUG: Log what we're about to send
+                    logger.debug(
+                        f"Fetching history for {symbol}: security_id={security_id} (type={type(security_id).__name__})"
+                    )
+
+                    response = self.dhan.historical_daily_data(
+                        security_id=str(security_id),  # SDK expects string
+                        exchange_segment=exchange_segment,  # Use string like "NSE_EQ"
+                        instrument_type="EQUITY",
+                        from_date=start_date.strftime("%Y-%m-%d"),
+                        to_date=end_date.strftime("%Y-%m-%d"),
+                    )
+                except Exception as e:
+                    # Treat transient transport errors as retryable (bounded)
+                    if attempt >= max_attempts:
+                        logger.error(f"Exception fetching history for {symbol} (attempt {attempt}): {e}")
+                        return None
+                    sleep_for = min(10.0, backoff_seconds)
+                    logger.warning(
+                        f"Exception fetching history for {symbol} (attempt {attempt}/{max_attempts}); "
+                        f"sleeping {sleep_for:.1f}s then retrying: {e}"
+                    )
+                    time.sleep(sleep_for)
+                    backoff_seconds = min(20.0, backoff_seconds * 2.0)
+                    continue
+                finally:
+                    # Always release connection (if not already released in exception path)
+                    try:
+                        self.rate_limiter.release_connection()
+                    except Exception:
+                        pass
+
+                if isinstance(response, dict) and response.get("status") == "success":
+                    data = response.get("data")
+                    return pd.DataFrame(data)
+
+                if _is_server_rate_limit(response):
+                    if attempt >= max_attempts:
+                        logger.error(f"Server rate-limit persists for {symbol} after {attempt} attempts: {response}")
+                        return None
+
+                    # Penalize limiter and retry with backoff.
+                    effective_now = self.rate_limiter._effective_rps(time.time())
+                    penalty_rps = max(0.5, float(effective_now) * 0.7)
+                    self.rate_limiter.penalize(cooldown_seconds=60.0, penalty_rps=penalty_rps)
+
+                    sleep_for = min(20.0, backoff_seconds)
+                    logger.warning(
+                        f"Server rate-limited historical data for {symbol} (DH-904). "
+                        f"Cooling down: sleep {sleep_for:.1f}s then retry (attempt {attempt}/{max_attempts}); "
+                        f"effective_rps≤{penalty_rps:.2f}"
+                    )
+                    time.sleep(sleep_for)
+                    backoff_seconds = min(20.0, backoff_seconds * 2.0)
+                    continue
+
+                logger.error(f"Failed to fetch history for {symbol}: {response}")
+                return None
                 
         except Exception as e:
             logger.error(f"Exception fetching history for {symbol}: {e}")
@@ -648,6 +845,10 @@ class DhanClientWrapper:
         
         try:
             security_id = self.get_security_id(symbol)
+            if not security_id:
+                # Lazy-load security master if needed
+                self.ensure_security_mapping_loaded()
+                security_id = self.get_security_id(symbol)
             if not security_id:
                 logger.error(f"Cannot place order: Security ID not found for {symbol}")
                 return None
@@ -794,6 +995,150 @@ class DhanClientWrapper:
         losers = list(reversed(movers[-top_n_losers:])) if movers else []
 
         return {"gainers": gainers, "losers": losers, "errors": errors}
+
+    def get_ohlc_snapshot(self, symbols, exchange_segment="NSE_EQ"):
+        """
+        Fetch OHLC-like snapshot (LTP, prev close, volume) for a symbol universe.
+
+        Returns a dict: symbol -> {ltp, prev_close, volume, turnover, change_pct}
+        """
+        if not self.is_connected:
+            return {}
+
+        if not self.ensure_security_mapping_loaded():
+            return {}
+
+        # Map symbols to security IDs
+        security_ids = []
+        for s in symbols:
+            sid = self.get_security_id(s)
+            if sid:
+                security_ids.append(int(sid))
+
+        if not security_ids:
+            return {}
+
+        def _iter_batches(items, size=100):
+            for i in range(0, len(items), size):
+                yield items[i:i + size]
+
+        def _is_server_rate_limit(resp) -> bool:
+            if not isinstance(resp, dict):
+                return False
+            if resp.get("status") != "failure":
+                return False
+            remarks = resp.get("remarks") or {}
+            data = resp.get("data") or {}
+            code = remarks.get("error_code") or data.get("errorCode")
+            etype = remarks.get("error_type") or data.get("errorType") or ""
+            msg = remarks.get("error_message") or data.get("errorMessage") or ""
+            if str(code).strip().upper() == "DH-904":
+                return True
+            if "RATE_LIMIT" in str(etype).strip().upper():
+                return True
+            if "rate limit" in str(msg).lower():
+                return True
+            return False
+
+        snapshot = {}
+
+        for batch in _iter_batches(security_ids, 100):
+            attempt = 0
+            backoff = 1.0
+            max_attempts = 6
+
+            while True:
+                attempt += 1
+
+                # Throttle REST calls too
+                self.rate_limiter.acquire(max_retries=None)
+                self.rate_limiter.acquire_connection()
+                try:
+                    response = self.dhan.ohlc_data({exchange_segment: batch})
+                except Exception as e:
+                    response = {"status": "failure", "remarks": {"error_message": str(e)}}
+                finally:
+                    self.rate_limiter.release_connection()
+
+                if _is_server_rate_limit(response):
+                    if attempt >= max_attempts:
+                        logger.error(f"OHLC snapshot batch rate-limited after {attempt} attempts: {response}")
+                        break
+
+                    effective_now = self.rate_limiter._effective_rps(time.time())
+                    penalty_rps = max(0.5, float(effective_now) * 0.7)
+                    self.rate_limiter.penalize(cooldown_seconds=60.0, penalty_rps=penalty_rps)
+
+                    sleep_for = min(20.0, backoff)
+                    logger.warning(
+                        f"OHLC snapshot rate-limited (DH-904). Sleeping {sleep_for:.1f}s then retrying "
+                        f"(attempt {attempt}/{max_attempts}); effective_rps≤{penalty_rps:.2f}"
+                    )
+                    time.sleep(sleep_for)
+                    backoff = min(20.0, backoff * 2.0)
+                    continue
+
+                if not response or response.get("status") != "success":
+                    logger.warning(f"OHLC snapshot failed for batch (attempt {attempt}): {response}")
+                    break
+
+                data = response.get("data", {})
+                segment_data = data.get(exchange_segment, data)
+
+                if isinstance(segment_data, dict):
+                    items = segment_data.items()
+                elif isinstance(segment_data, list):
+                    items = [(d.get("securityId") or d.get("security_id"), d) for d in segment_data]
+                else:
+                    items = []
+
+                for sid, payload in items:
+                    try:
+                        if payload is None:
+                            continue
+                        sid_int = int(sid) if sid is not None else None
+                        symbol = self.id_map.get(sid_int)
+                        if not symbol:
+                            continue
+
+                        ltp = (
+                            payload.get("ltp")
+                            or payload.get("LTP")
+                            or payload.get("last_traded_price")
+                            or payload.get("last_price")
+                        )
+                        prev_close = (
+                            payload.get("prev_close")
+                            or payload.get("prevClose")
+                            or payload.get("close")
+                        )
+                        volume = payload.get("volume") or payload.get("total_volume") or 0.0
+
+                        if ltp is None or prev_close is None:
+                            continue
+
+                        ltp = float(ltp)
+                        prev_close = float(prev_close)
+                        volume = float(volume or 0.0)
+                        if prev_close <= 0:
+                            continue
+
+                        change_pct = ((ltp - prev_close) / prev_close) * 100.0
+                        turnover = volume * ltp if volume else 0.0
+
+                        snapshot[symbol] = {
+                            "ltp": ltp,
+                            "prev_close": prev_close,
+                            "volume": volume,
+                            "turnover": turnover,
+                            "change_pct": change_pct,
+                        }
+                    except Exception:
+                        continue
+
+                break
+
+        return snapshot
 
     def square_off_position(self, symbol, quantity, transaction_type):
         """Square off a position."""

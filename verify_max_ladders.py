@@ -1,4 +1,5 @@
 import logging
+import time
 from unittest.mock import MagicMock
 
 from config import StockStatus, StrategySettings
@@ -11,6 +12,13 @@ logging.basicConfig(level=logging.INFO)
 def test_max_ladder_stocks_limits_new_starts():
     mock_dhan = MagicMock(spec=DhanClientWrapper)
     mock_dhan.is_connected = True
+    counter = {"i": 0}
+
+    def _place_order(**kwargs):
+        counter["i"] += 1
+        return {"status": "success", "orderId": str(counter["i"])}
+
+    mock_dhan.place_order = MagicMock(side_effect=_place_order)
 
     engine = LadderEngine(mock_dhan)
     engine.running = True
@@ -42,6 +50,8 @@ def test_max_ladder_stocks_limits_new_starts():
             stop_loss=0.0,
             target=0.0,
             prev_close=95.0,
+            day_open=95.0,
+            open_gap_pct=0.0,
             turnover=2_00_00_000.0,  # 2 Cr
         )
     for i in range(60):
@@ -60,30 +70,29 @@ def test_max_ladder_stocks_limits_new_starts():
             stop_loss=0.0,
             target=0.0,
             prev_close=105.0,
+            day_open=105.0,
+            open_gap_pct=0.0,
             turnover=2_00_00_000.0,  # 2 Cr
         )
 
     engine.active_stocks = active
 
-    def _start_long(stock: StockStatus):
-        stock.mode = "LONG"
-        stock.status = "ACTIVE"
-        stock.quantity = 1
-
-    def _start_short(stock: StockStatus):
-        stock.mode = "SHORT"
-        stock.status = "ACTIVE"
-        stock.quantity = 1
-
-    engine.start_long_ladder = MagicMock(side_effect=_start_long)
-    engine.start_short_ladder = MagicMock(side_effect=_start_short)
-
     # Run selection multiple times; should only start up to 10 longs + 10 shorts total.
     for _ in range(5):
         engine.select_top_movers()
 
-    assert engine.start_long_ladder.call_count == 10, "Should start only top 10 gainers"
-    assert engine.start_short_ladder.call_count == 10, "Should start only top 10 losers"
+    # Wait for async workers to execute queued orders
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        active_positions = [s for s in engine.active_stocks.values() if s.mode != "NONE"]
+        if len(active_positions) == 20:
+            break
+        time.sleep(0.05)
+
+    active_positions = [s for s in engine.active_stocks.values() if s.mode != "NONE"]
+    assert len(active_positions) == 20, "Should start only 20 ladders total"
+    assert len([s for s in active_positions if s.mode == "LONG"]) == 10
+    assert len([s for s in active_positions if s.mode == "SHORT"]) == 10
 
 
 def test_settings_enforce_sum_with_max_ladder_stocks():
@@ -139,11 +148,9 @@ def test_session_max_blocks_new_symbols_even_if_capacity_frees_up():
         )
     }
 
-    engine.start_long_ladder = MagicMock()
-    engine.start_short_ladder = MagicMock()
     engine.select_top_movers()
-    assert engine.start_long_ladder.call_count == 0
-    assert engine.start_short_ladder.call_count == 0
+    assert engine.active_stocks["X1"].pending_order == ""
+    assert engine.active_stocks["X1"].mode == "NONE"
 
 
 if __name__ == "__main__":
